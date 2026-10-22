@@ -24,6 +24,8 @@ jobs:
         run: pip install tox
       - name: Lint
         run: tox -e lint
+      - name: Unit tests
+        run: tox -e unit
       - name: Check packaging
         run: tox -e twine_check
 

@@ -19,12 +19,13 @@
 # SOFTWARE.
 
 import logging
+import math
 import os
 import shlex
 import subprocess
 import sys
 from contextlib import ExitStack
-from typing import Callable, Dict, List, Optional, Set, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 from WDL import Type, Value
 from WDL.runtime import config
@@ -38,7 +39,9 @@ class SlurmSingularity(SingularityContainer):
     def __init__(self, cfg: config.Loader, run_id: str, host_dir: str) -> None:
         super().__init__(cfg, run_id, host_dir)
         self._last_exit_code: Optional[int] = None
+        self._last_job_state: Optional[str] = None
         self._oom_retry_count = 0
+        self._timeout_retry_count = 0
 
     @classmethod
     def global_init(cls, cfg: config.Loader, logger: logging.Logger) -> None:
@@ -89,37 +92,22 @@ class SlurmSingularity(SingularityContainer):
                 Type.String()).value
             self.runtime_values["slurm_account"] = slurm_account
 
-        if "slurm_account_gpu" in runtime_eval:
-            slurm_account_gpu = runtime_eval["slurm_account_gpu"].coerce(
-                Type.String()).value
-            self.runtime_values["slurm_account_gpu"] = slurm_account_gpu
-
         if "slurm_partition" in runtime_eval:
             slurm_partition = runtime_eval["slurm_partition"].coerce(
                 Type.String()).value
             self.runtime_values["slurm_partition"] = slurm_partition
-
-        if "slurm_partition_gpu" in runtime_eval:
-            slurm_partition_gpu = runtime_eval["slurm_partition_gpu"].coerce(
-                Type.String()).value
-            self.runtime_values["slurm_partition_gpu"] = slurm_partition_gpu
 
         if "slurm_qos" in runtime_eval:
             slurm_qos = runtime_eval["slurm_qos"].coerce(
                 Type.String()).value
             self.runtime_values["slurm_qos"] = slurm_qos
 
-        if "slurm_qos_gpu" in runtime_eval:
-            slurm_qos_gpu = runtime_eval["slurm_qos_gpu"].coerce(
-                Type.String()).value
-            self.runtime_values["slurm_qos_gpu"] = slurm_qos_gpu
-
         if "gpuCount" in runtime_eval:
             gpuCount = max(1, runtime_eval["gpuCount"].coerce(Type.Int()).value)
             self.runtime_values["gpuCount"] = gpuCount
 
         if "gpuType" in runtime_eval and runtime_eval["gpuType"]:
-            gpuType = runtime_eval["gpuType"].coerce(Type.String()).value
+            gpuType = runtime_eval["gpuType"].coerce(Type.String()).value.strip()
             self.runtime_values["gpuType"] = gpuType
 
         if "slurm_constraint" in runtime_eval:
@@ -155,14 +143,10 @@ class SlurmSingularity(SingularityContainer):
             # If no gpuType is given, use the default GPU type.
             sbatch_args.extend(["--gres", f"gpu:{gpuCount}"])
 
-        if gpuCount is not None:
-            partition = self.runtime_values.get("slurm_partition_gpu", None)
-            qos = self.runtime_values.get("slurm_qos_gpu", None)
-            account = self.runtime_values.get("slurm_account_gpu", None)
-        else:
-            partition = self.runtime_values.get("slurm_partition", None)
-            qos = self.runtime_values.get("slurm_qos", None)
-            account = self.runtime_values.get("slurm_account", None)
+        # Use dynamic_partition with gpuCount for separate GPU routing.
+        partition = self.runtime_values.get("slurm_partition", None)
+        qos = self.runtime_values.get("slurm_qos", None)
+        account = self.runtime_values.get("slurm_account", None)
 
         if partition is not None:
             sbatch_args.extend(["--partition", partition])
@@ -181,8 +165,9 @@ class SlurmSingularity(SingularityContainer):
             # Round to the nearest megabyte.
             sbatch_args.extend(["--mem", f"{round(memory / (1024 ** 2))}M"])
 
-        time_minutes = self.runtime_values.get("time_minutes", None)
+        time_minutes = self._retry_adjusted_time_minutes()
         if time_minutes is not None:
+            self._log_retry_time_adjustment(logger, time_minutes)
             sbatch_args.extend(["--time", str(time_minutes)])
 
         slurm_constraint = self.runtime_values.get("slurm_constraint", None)
@@ -224,37 +209,92 @@ class SlurmSingularity(SingularityContainer):
         # Line copied from base class as value is not publicly exposed.
         cli_log_filename = os.path.join(self.host_dir, f"{self.cli_name}.log.txt")
         exit_code = None
+        job_state = None
         try:
             exit_code = super()._run(logger, terminating, command)
+            # sbatch --wait has no unique exit code for walltime failures.
+            if (self.runtime_values.get("time_minutes", 0) > 0
+                    and not self.success_exit_code(exit_code) and not terminating()):
+                job_state = self._slurm_job_state(logger, cli_log_filename)
             return exit_code
         finally:
-            self._record_exit_code(exit_code)
+            self._record_exit_code(exit_code, job_state)
             if terminating():  # Cancel the job if terminating
-                with open(cli_log_filename, "rt") as submit_log:
-                    # "job_id" or "job_id;cluster_name" are output with --parsable.
-                    job_id, *clusters = submit_log.read().strip().split(";", maxsplit=1)
+                job_id, cluster = self._slurm_job_id(cli_log_filename)
                 if job_id.isdigit():  # A valid job ID.
                     scancel_args = ["scancel"]
-                    if clusters:
-                        scancel_args.append(f"--clusters={clusters[0]}")
+                    if cluster:
+                        scancel_args.append(f"--clusters={cluster}")
                     subprocess.run(scancel_args + [job_id])
+
+    def _slurm_job_id(self, cli_log_filename: str) -> Tuple[str, Optional[str]]:
+        with open(cli_log_filename, "rt") as submit_log:
+            for line in submit_log:
+                # --parsable writes "job_id" or "job_id;cluster_name".
+                job_id, *clusters = line.strip().split(";", maxsplit=1)
+                if job_id.isdigit():
+                    return job_id, clusters[0] if clusters else None
+        return "", None
+
+    def _slurm_job_state(self, logger: logging.Logger,
+                         cli_log_filename: str) -> Optional[str]:
+        try:
+            job_id, cluster = self._slurm_job_id(cli_log_filename)
+            if not job_id:
+                raise ValueError("submission log contains no Slurm job ID")
+            invocation = ["scontrol", "--oneliner"]
+            if cluster:
+                invocation.append(f"--clusters={cluster}")
+            invocation.extend(["show", "job", job_id])
+            result = subprocess.run(
+                invocation, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, check=True, timeout=10
+            )
+            fields = dict(field.split("=", 1) for field in result.stdout.split()
+                          if "=" in field)
+            state = fields.get("JobState")
+            # Cleanup can temporarily hide TIMEOUT behind the COMPLETING flag.
+            if state == "COMPLETING" and fields.get("Reason") == "TimeLimit":
+                return "TIMEOUT"
+            if state:
+                return state
+            raise ValueError("scontrol output contains no JobState")
+        except (OSError, ValueError, subprocess.SubprocessError) as ex:
+            logger.warning(
+                "Unable to determine Slurm job state; retry time limit will not "
+                "be increased: %s", ex
+            )
+            return None
 
     attribute_lookup = {
         'memory': 'memory_reservation',
     }
 
-    def _record_exit_code(self, exit_code: Optional[int]) -> None:
+    def _record_exit_code(self, exit_code: Optional[int],
+                          job_state: Optional[str] = None) -> None:
         self._last_exit_code = exit_code
+        self._last_job_state = job_state
         if exit_code in self.OOM_EXIT_CODES:
             self._oom_retry_count += 1
         else:
             self._oom_retry_count = 0
+        if job_state == "TIMEOUT":
+            self._timeout_retry_count += 1
+        else:
+            self._timeout_retry_count = 0
 
     def _retry_adjusted_memory_reservation(self) -> Union[int, float, None]:
         memory = self.runtime_values.get("memory_reservation", None)
         if memory is not None and self.try_counter > 1 and self._oom_retry_count:
             memory *= 1.5 ** self._oom_retry_count
         return memory
+
+    def _retry_adjusted_time_minutes(self) -> Optional[int]:
+        time_minutes = self.runtime_values.get("time_minutes", None)
+        if (time_minutes is not None and self.try_counter > 1
+                and self._timeout_retry_count):
+            time_minutes = math.ceil(time_minutes * 1.5 ** self._timeout_retry_count)
+        return time_minutes
 
     def _log_retry_memory_adjustment(self, logger: logging.Logger,
                                      adjusted_memory: Union[int, float]) -> None:
@@ -271,9 +311,27 @@ class SlurmSingularity(SingularityContainer):
             f"{round(adjusted_memory / (1024 ** 2))}M"
         )
 
+    def _log_retry_time_adjustment(self, logger: logging.Logger,
+                                   adjusted_time_minutes: int) -> None:
+        original_time_minutes = self.runtime_values.get("time_minutes", None)
+        if (original_time_minutes is None
+                or adjusted_time_minutes == original_time_minutes):
+            return
+
+        logger.info(
+            "Retrying with increased Slurm time limit: "
+            f"try {self.try_counter}; "
+            f"consecutive walltime-limit failures {self._timeout_retry_count}; "
+            f"previous job state {self._last_job_state}; "
+            f"previous exit code {self._last_exit_code}; "
+            f"{original_time_minutes} -> {adjusted_time_minutes} minutes"
+        )
+
     def _rule_runtime_value(self, attr_name: str) -> Union[int, float, None]:
         if attr_name == "memory_reservation":
             return self._retry_adjusted_memory_reservation()
+        if attr_name == "time_minutes":
+            return self._retry_adjusted_time_minutes()
 
         runtime_value = self.runtime_values.get(attr_name)
         if isinstance(runtime_value, (int, float)):

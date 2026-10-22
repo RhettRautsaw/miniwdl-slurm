@@ -7,6 +7,9 @@ Unreleased
 + Refactor SLURM account, partition, qos handling logic for cleaner code
 + Increase requested Slurm memory by 1.5x after out-of-memory task failures
   and log when retry memory is increased.
++ Increase requested Slurm ``time_minutes`` by 1.5x after confirmed walltime
+  failures (``TIMEOUT`` from ``scontrol``), rounding up to whole minutes,
+  logging the increase, and using it in dynamic rules.
 + Make ``dynamic_partition`` rules with missing runtime attributes fail to
   match, allowing optional attributes such as ``gpuCount`` to select rules.
 

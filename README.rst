@@ -86,6 +86,22 @@ example can be used to use miniwdl on a SLURM cluster:
     # extra arguments passed to the sbatch command (optional).
     extra_args="--partition heavy_users,gpu --comment 'run with miniwdl'"
 
+When a task is retried according to ``runtime.maxRetries``, its requested
+``runtime.time_minutes`` is increased only after Slurm reports the job state
+as ``TIMEOUT``. The original time limit is multiplied by
+``1.5 ** consecutive_timeout_count`` and rounded up to whole minutes. For
+example, a 60-minute initial limit becomes 90 minutes after one timeout and
+135 minutes after two consecutive timeouts. Each increase is logged with the
+attempt number, previous job state and exit code, and original and adjusted
+time limits. A failure without a confirmed timeout resets the time limit to
+the original value on the next attempt. An unset or zero time limit is unchanged.
+Rules for ``time_minutes`` in ``dynamic_partition`` use the adjusted time limit.
+
+Timeout detection uses ``scontrol show job`` on the submission host, since
+``sbatch --wait`` exit codes do not distinguish timeouts from other signal
+terminations. A job still in ``COMPLETING`` with ``Reason=TimeLimit`` is also
+treated as a confirmed timeout. If the job state cannot be determined, a
+warning is logged and the next attempt uses the original time limit.
 
 
 In some cases, you may wish to dynamically modify the SLURM submission arguments.
